@@ -1,0 +1,6 @@
+fastmcp>=2.0.0
+retinalysis-fundusprep
+retinalysis-inference
+pillow
+numpy
+opencv-python-headless
