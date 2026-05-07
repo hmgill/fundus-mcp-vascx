@@ -26,12 +26,12 @@ import logging
 import os
 import sys
 import tempfile
-from datetime import timedelta
 from pathlib import Path
 
 from fastmcp import FastMCP
 from fastmcp.dependencies import Progress
 from fastmcp.server.tasks import TaskConfig
+from datetime import timedelta
 
 logging.basicConfig(format="[%(levelname)s]: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -117,9 +117,13 @@ _is_inspect = (
     or "inspect" in " ".join(sys.argv)
 )
 if not _is_inspect:
-    logger.info(f"Pre-warming VascX models at module import (PID={os.getpid()}) ...")
-    _get_runner()
-    logger.info("Models ready.")
+    try:
+        logger.info(f"Pre-warming VascX models at module import (PID={os.getpid()}) ...")
+        _get_runner()
+        logger.info("Models ready.")
+    except Exception as _prewarm_err:
+        logger.error(f"Pre-warm failed (PID={os.getpid()}): {_prewarm_err}", exc_info=True)
+        # Don't crash the server — tools will attempt to load on first call
 else:
     logger.info("Skipping model pre-warm during fastmcp inspect (build time).")
 
@@ -182,9 +186,8 @@ async def segment_av(
     import numpy as np
     from datetime import datetime
 
-    await progress.set_total(3)
-
     try:
+        await progress.set_total(3)
         await progress.set_message("Loading models...")
         runner = _get_runner()
 
@@ -195,14 +198,14 @@ async def segment_av(
                 rgb_img, ce_img, bounds = _preprocess(image_b64, image_id, tmp)
             except RuntimeError as e:
                 return json.dumps({"success": False, "reason": str(e)})
-            await progress.increment()
 
+            await progress.increment()
             await progress.set_message("Running AV segmentation...")
             av_pred = runner.seg.predict_preprocessed(
                 [np.array(rgb_img)], [np.array(ce_img)]
             )[0]
-            await progress.increment()
 
+            await progress.increment()
             await progress.set_message("Computing mask statistics...")
             av_raw  = av_pred.astype(np.uint8)
             rgb_arr = np.array(rgb_img)
@@ -266,9 +269,8 @@ async def localize_fovea(
     """
     import numpy as np
 
-    await progress.set_total(3)
-
     try:
+        await progress.set_total(3)
         await progress.set_message("Loading models...")
         runner = _get_runner()
 
@@ -279,19 +281,18 @@ async def localize_fovea(
                 rgb_img, ce_img, _ = _preprocess(image_b64, image_id, tmp)
             except RuntimeError as e:
                 return json.dumps({"success": False, "reason": str(e)})
-            await progress.increment()
 
+            await progress.increment()
             await progress.set_message("Localizing fovea...")
             hm_pred = runner.hm.predict_preprocessed(
                 [np.array(rgb_img)], [np.array(ce_img)]
             )[0]
-            await progress.increment()
 
             y, x = np.unravel_index(np.argmax(hm_pred), hm_pred.shape)
-
-            await progress.set_message("Done.")
             await progress.increment()
+            await progress.set_message("Done.")
 
+            await progress.increment()
             return json.dumps({
                 "success":  True,
                 "image_id": image_id,
