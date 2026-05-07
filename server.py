@@ -49,6 +49,32 @@ def _ensure_headless_opencv():
 
 _ensure_headless_opencv()
 
+# ---------------------------------------------------------------------------
+# Ensure retinalysis-inference is importable.
+# Its tight dependency pins (huggingface-hub==0.25.1, albumentations==1.3.1
+# etc.) may cause pip to skip or partially install it when resolving the full
+# requirements.txt. Install it with --no-deps as a fallback so the inference
+# classes are always available regardless of pip resolution order.
+# ---------------------------------------------------------------------------
+def _ensure_rtnls_inference():
+    try:
+        import rtnls_inference  # noqa: F401 — already installed, nothing to do
+    except ImportError:
+        print("[INFO]: rtnls_inference not found, installing retinalysis-inference --no-deps ...", file=sys.stderr)
+        try:
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install", "--quiet",
+                "--no-deps", "retinalysis-inference",
+            ])
+            import importlib
+            importlib.invalidate_caches()
+            print("[INFO]: retinalysis-inference installed.", file=sys.stderr)
+        except Exception as e:
+            print(f"[ERROR]: Failed to install retinalysis-inference: {e}", file=sys.stderr)
+
+_ensure_rtnls_inference()
+
+
 import base64
 import io
 import json
