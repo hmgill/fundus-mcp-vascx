@@ -99,8 +99,6 @@ logger = logging.getLogger(__name__)
 WEIGHTS_DIR   = Path(__file__).parent / "weights"
 AV_WEIGHTS    = WEIGHTS_DIR / "av_july24.pt"
 FOVEA_WEIGHTS = WEIGHTS_DIR / "fovea-july24.pt"
-TMP_CACHE_DIR = Path("/tmp/vascx-model-cache")
-
 # Redis is required for background tasks to work across stateless HTTP requests.
 # Each request may hit a different process; in-memory task state won't survive.
 # Set FASTMCP_DOCKET_URL=rediss://... in your Horizon environment variables.
@@ -135,29 +133,17 @@ def _get_runner():
     from rtnls_inference import SegmentationEnsemble, HeatmapRegressionEnsemble
     from rtnls_fundusprep.preprocessor import parallel_preprocess
 
-    # Use /tmp cache if available — avoids re-parsing .pt files on cold starts
-    av_src    = str(TMP_CACHE_DIR / "av_july24.pt")    if (TMP_CACHE_DIR / "av_july24.pt").exists()    else str(AV_WEIGHTS)
-    fovea_src = str(TMP_CACHE_DIR / "fovea-july24.pt") if (TMP_CACHE_DIR / "fovea-july24.pt").exists() else str(FOVEA_WEIGHTS)
-
-    if av_src != str(AV_WEIGHTS):
-        logger.info(f"Loading AV model from /tmp cache (PID={os.getpid()}) ...")
-    else:
-        logger.info(f"Loading AV model from weights/ (PID={os.getpid()}) ...")
+    # TorchScript .pt files load directly — no /tmp caching needed.
+    # The module-level _get_runner() call keeps models in _runner across
+    # warm invocations within the same container.
+    logger.info(f"Loading VascX models from weights/ (PID={os.getpid()}) ...")
 
     class _Runner:
-        seg        = SegmentationEnsemble.from_file(av_src)
-        hm         = HeatmapRegressionEnsemble.from_file(fovea_src)
+        seg        = SegmentationEnsemble.from_torchscript(str(AV_WEIGHTS))
+        hm         = HeatmapRegressionEnsemble.from_torchscript(str(FOVEA_WEIGHTS))
         preprocess = staticmethod(parallel_preprocess)
 
     _runner = _Runner()
-
-    # Save to /tmp so subsequent cold starts in this container load faster
-    if not TMP_CACHE_DIR.exists():
-        logger.info(f"Saving parsed weights to {TMP_CACHE_DIR} ...")
-        TMP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        torch.save(_runner.seg,  str(TMP_CACHE_DIR / "av_july24.pt"))
-        torch.save(_runner.hm,   str(TMP_CACHE_DIR / "fovea-july24.pt"))
-        logger.info("Cache saved.")
 
     logger.info("VascX models ready.")
     return _runner
@@ -373,7 +359,6 @@ async def health() -> str:
             "av_exists":    AV_WEIGHTS.exists(),
             "fovea_exists": FOVEA_WEIGHTS.exists(),
         },
-        "tmp_cache": TMP_CACHE_DIR.exists(),
     })
 
 
