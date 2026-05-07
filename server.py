@@ -149,24 +149,10 @@ def _get_runner():
     return _runner
 
 
-# Pre-warm only when running as a real server, not during `fastmcp inspect`.
-# inspect imports the module to discover tools but doesn't start uvicorn,
-# so we skip the heavy opencv/torch imports to avoid libxcb/X11 errors in
-# the Horizon build container.
-_is_inspect = (
-    os.environ.get("FASTMCP_INSPECT") == "1"
-    or "inspect" in " ".join(sys.argv)
-)
-if not _is_inspect:
-    try:
-        logger.info(f"Pre-warming VascX models at module import (PID={os.getpid()}) ...")
-        _get_runner()
-        logger.info("Models ready.")
-    except Exception as _prewarm_err:
-        logger.error(f"Pre-warm failed (PID={os.getpid()}): {_prewarm_err}", exc_info=True)
-        # Don't crash the server — tools will attempt to load on first call
-else:
-    logger.info("Skipping model pre-warm during fastmcp inspect (build time).")
+# Models are loaded lazily on first tool call — do NOT pre-warm at import.
+# Each .pt file is ~337 MB; loading both at startup exceeds the Lambda
+# memory budget and causes a SIGKILL before the server comes up.
+# _get_runner() caches the result in _runner so subsequent calls are free.
 
 # ---------------------------------------------------------------------------
 # FastMCP app
