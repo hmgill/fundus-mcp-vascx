@@ -24,6 +24,7 @@ import io
 import json
 import logging
 import os
+import sys
 import tempfile
 from datetime import timedelta
 from pathlib import Path
@@ -34,6 +35,7 @@ from fastmcp.server.tasks import TaskConfig
 
 logging.basicConfig(format="[%(levelname)s]: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -106,13 +108,20 @@ def _get_runner():
     return _runner
 
 
-# ---------------------------------------------------------------------------
-# Pre-warm at module import — runs once per container cold start
-# ---------------------------------------------------------------------------
-
-logger.info(f"Pre-warming VascX models at module import (PID={os.getpid()}) ...")
-_get_runner()
-logger.info("Models ready.")
+# Pre-warm only when running as a real server, not during `fastmcp inspect`.
+# inspect imports the module to discover tools but doesn't start uvicorn,
+# so we skip the heavy opencv/torch imports to avoid libxcb/X11 errors in
+# the Horizon build container.
+_is_inspect = (
+    os.environ.get("FASTMCP_INSPECT") == "1"
+    or "inspect" in " ".join(sys.argv)
+)
+if not _is_inspect:
+    logger.info(f"Pre-warming VascX models at module import (PID={os.getpid()}) ...")
+    _get_runner()
+    logger.info("Models ready.")
+else:
+    logger.info("Skipping model pre-warm during fastmcp inspect (build time).")
 
 # ---------------------------------------------------------------------------
 # FastMCP app
