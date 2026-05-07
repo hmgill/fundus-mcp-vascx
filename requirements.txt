@@ -3,4 +3,6 @@ numpy
 opencv-python-headless
 pillow
 retinalysis-fundusprep
-retinalysis-inference
+retinalysis-vascx
+torch
+torchvision
