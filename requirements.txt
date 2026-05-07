@@ -1,11 +1,10 @@
 # Force headless OpenCV before retinalysis pulls in the GUI variant.
 # libxcb.so.1 (X11) is not available in the Horizon build container.
 opencv-python-headless
-
 fastmcp[tasks]>=3.2.4
 numpy
 pillow
 retinalysis-fundusprep
-retinalysis-vascx
+retinalysis-inference
 torch
 torchvision
