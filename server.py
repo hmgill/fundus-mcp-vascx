@@ -19,12 +19,41 @@ Tools:
 
 from __future__ import annotations
 
+import subprocess
+import sys
+
+# ---------------------------------------------------------------------------
+# Force headless OpenCV before any other import touches cv2.
+# retinalysis-fundusprep/vascx pulls in opencv-python (GUI variant) as a
+# transitive dependency, which requires libxcb.so.1 (X11) — not available
+# in the Horizon runtime container. We force-reinstall the headless variant
+# here, before cv2 is imported anywhere, so the correct shared library is used.
+# ---------------------------------------------------------------------------
+def _ensure_headless_opencv():
+    try:
+        import importlib.util
+        spec = importlib.util.find_spec("cv2")
+        if spec is None:
+            return  # not installed yet, requirements.txt will handle it
+        cv2_path = spec.origin or ""
+        if "headless" not in cv2_path:
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install", "--quiet",
+                "--force-reinstall", "--no-deps", "opencv-python-headless",
+            ])
+            # Invalidate import caches so next cv2 import gets the headless build
+            import importlib
+            importlib.invalidate_caches()
+    except Exception as e:
+        print(f"[WARNING]: opencv headless check failed: {e}", file=sys.stderr)
+
+_ensure_headless_opencv()
+
 import base64
 import io
 import json
 import logging
 import os
-import sys
 import tempfile
 from pathlib import Path
 
