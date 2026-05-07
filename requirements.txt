@@ -1,9 +1,22 @@
-# Force headless OpenCV before retinalysis pulls in the GUI variant.
-# libxcb.so.1 (X11) is not available in the Horizon build container.
-opencv-python-headless
+# opencv-python-headless listed first — retinalysis-inference hard-requires
+# opencv-python==4.* (GUI variant, needs X11/libxcb unavailable on Horizon).
+# server.py force-reinstalls the headless variant at startup to guarantee
+# the correct build wins. retinalysis-inference itself is installed via
+# --no-deps fallback in server.py if pip's resolver skips it due to pin conflicts.
+opencv-python-headless>=4.0,<5.0
+
 fastmcp[tasks]>=3.2.4
-numpy
-pillow
+numpy>=1.24
+pandas>=2.0
+pillow>=10.0
+click>=8.0
+joblib>=1.0
+PyYAML>=5.4
+lightning>=2.0
+albumentations>=1.3
+monai>=1.3
+huggingface-hub>=0.20
+GPUtil>=1.4
 retinalysis-fundusprep
 retinalysis-inference
 torch
