@@ -4,10 +4,21 @@ server.py — fundus-mcp-vascx
 FastMCP server exposing VascX artery/vein segmentation and fovea
 localization as MCP tools, deployed via Prefect Horizon.
 
-Weights are committed to the repo via Git LFS and loaded from
-the ./weights/ directory at startup. No download required.
+Preprocessing runs locally (fundusprep); GPU inference is dispatched to a
+RunPod serverless endpoint so Horizon doesn't need a GPU or the heavy
+TorchScript weights baked in.
 
-Expected weight files:
+Required environment variables:
+    RUNPOD_API_KEY       RunPod API key
+    RUNPOD_ENDPOINT_URL  Full RunPod endpoint base URL,
+                         e.g. https://api.runpod.ai/v2/<endpoint_id>
+
+Optional environment variables:
+    FASTMCP_DOCKET_URL   rediss://<host>:<port>  Redis for background tasks
+    RUNPOD_POLL_INTERVAL Seconds between status polls (default: 3)
+    RUNPOD_MAX_WAIT      Seconds before timeout (default: 120)
+
+Expected weight files (for health check only — not loaded locally):
     weights/av_july24.pt        AV segmentation ensemble
     weights/fovea-july24.pt     Fovea localization heatmap regression
 
@@ -24,24 +35,19 @@ import sys
 
 # ---------------------------------------------------------------------------
 # Force headless OpenCV before any other import touches cv2.
-# retinalysis-fundusprep/vascx pulls in opencv-python (GUI variant) as a
-# transitive dependency, which requires libxcb.so.1 (X11) — not available
-# in the Horizon runtime container. We force-reinstall the headless variant
-# here, before cv2 is imported anywhere, so the correct shared library is used.
 # ---------------------------------------------------------------------------
 def _ensure_headless_opencv():
     try:
         import importlib.util
         spec = importlib.util.find_spec("cv2")
         if spec is None:
-            return  # not installed yet, requirements.txt will handle it
+            return
         cv2_path = spec.origin or ""
         if "headless" not in cv2_path:
             subprocess.check_call([
                 sys.executable, "-m", "pip", "install", "--quiet",
                 "--force-reinstall", "--no-deps", "opencv-python-headless",
             ])
-            # Invalidate import caches so next cv2 import gets the headless build
             import importlib
             importlib.invalidate_caches()
     except Exception as e:
@@ -51,14 +57,10 @@ _ensure_headless_opencv()
 
 # ---------------------------------------------------------------------------
 # Ensure retinalysis-inference is importable.
-# Its tight dependency pins (huggingface-hub==0.25.1, albumentations==1.3.1
-# etc.) may cause pip to skip or partially install it when resolving the full
-# requirements.txt. Install it with --no-deps as a fallback so the inference
-# classes are always available regardless of pip resolution order.
 # ---------------------------------------------------------------------------
 def _ensure_rtnls_inference():
     try:
-        import rtnls_inference  # noqa: F401 — already installed, nothing to do
+        import rtnls_inference  # noqa: F401
     except ImportError:
         print("[INFO]: rtnls_inference not found, installing retinalysis-inference --no-deps ...", file=sys.stderr)
         try:
@@ -80,9 +82,11 @@ import io
 import json
 import logging
 import os
+import time
 import tempfile
 from pathlib import Path
 
+import requests
 from fastmcp import FastMCP
 from fastmcp.dependencies import Progress
 from fastmcp.server.tasks import TaskConfig
@@ -99,9 +103,17 @@ logger = logging.getLogger(__name__)
 WEIGHTS_DIR   = Path(__file__).parent / "weights"
 AV_WEIGHTS    = WEIGHTS_DIR / "av_july24.pt"
 FOVEA_WEIGHTS = WEIGHTS_DIR / "fovea-july24.pt"
-# Redis is required for background tasks to work across stateless HTTP requests.
-# Each request may hit a different process; in-memory task state won't survive.
-# Set FASTMCP_DOCKET_URL=rediss://... in your Horizon environment variables.
+
+RUNPOD_API_KEY      = os.environ.get("RUNPOD_API_KEY", "")
+RUNPOD_ENDPOINT_URL = os.environ.get("RUNPOD_ENDPOINT_URL", "").rstrip("/")
+RUNPOD_POLL_INTERVAL = int(os.environ.get("RUNPOD_POLL_INTERVAL", "3"))
+RUNPOD_MAX_WAIT      = int(os.environ.get("RUNPOD_MAX_WAIT", "120"))
+
+if not RUNPOD_API_KEY:
+    logger.warning("RUNPOD_API_KEY is not set — inference calls will fail.")
+if not RUNPOD_ENDPOINT_URL:
+    logger.warning("RUNPOD_ENDPOINT_URL is not set — inference calls will fail.")
+
 _redis_url = os.environ.get("FASTMCP_DOCKET_URL")
 if not _redis_url:
     logger.warning(
@@ -109,84 +121,111 @@ if not _redis_url:
         "stateless HTTP requests. Set this to your Redis URL in Horizon env vars."
     )
 
-# ---------------------------------------------------------------------------
-# Model loader with /tmp caching
-# ---------------------------------------------------------------------------
-
-_runner = None
-
-
-def _get_runner():
-    global _runner
-    if _runner is not None:
-        return _runner
-
-    import cv2
-    import torch
-    cv2.setNumThreads(1)
-
-    if not AV_WEIGHTS.exists():
-        raise FileNotFoundError(f"AV weights not found: {AV_WEIGHTS}")
-    if not FOVEA_WEIGHTS.exists():
-        raise FileNotFoundError(f"Fovea weights not found: {FOVEA_WEIGHTS}")
-
-    from rtnls_inference import SegmentationEnsemble, HeatmapRegressionEnsemble
-    from rtnls_fundusprep.preprocessor import parallel_preprocess
-
-    # TorchScript .pt files load directly — no /tmp caching needed.
-    # The module-level _get_runner() call keeps models in _runner across
-    # warm invocations within the same container.
-    logger.info(f"Loading VascX models from weights/ (PID={os.getpid()}) ...")
-
-    class _Runner:
-        seg        = SegmentationEnsemble.from_torchscript(str(AV_WEIGHTS))
-        hm         = HeatmapRegressionEnsemble.from_torchscript(str(FOVEA_WEIGHTS))
-        preprocess = staticmethod(parallel_preprocess)
-
-    _runner = _Runner()
-
-    logger.info("VascX models ready.")
-    return _runner
-
-
-# Models are loaded lazily on first tool call — do NOT pre-warm at import.
-# Each .pt file is ~337 MB; loading both at startup exceeds the Lambda
-# memory budget and causes a SIGKILL before the server comes up.
-# _get_runner() caches the result in _runner so subsequent calls are free.
 
 # ---------------------------------------------------------------------------
-# FastMCP app
+# RunPod client
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP("fundus-vascx")
+def _runpod_session() -> requests.Session:
+    """Return a requests Session pre-configured with RunPod auth headers."""
+    session = requests.Session()
+    session.headers.update({
+        "Authorization": f"Bearer {RUNPOD_API_KEY}",
+        "Content-Type":  "application/json",
+    })
+    return session
+
+
+def _runpod_dispatch(task: str, image_id: str, rgb_b64: str, ce_b64: str) -> dict:
+    """
+    Submit a job to the RunPod serverless endpoint and poll until complete.
+
+    Returns the output dict on success. Raises RuntimeError on failure or timeout.
+    """
+    session = _runpod_session()
+
+    # Submit
+    resp = session.post(
+        f"{RUNPOD_ENDPOINT_URL}/run",
+        json={"input": {
+            "task":     task,
+            "image_id": image_id,
+            "rgb_b64":  rgb_b64,
+            "ce_b64":   ce_b64,
+        }},
+    )
+    resp.raise_for_status()
+    job_id = resp.json().get("id")
+    if not job_id:
+        raise RuntimeError(f"No job ID in RunPod response: {resp.json()}")
+    logger.info(f"[{image_id}] RunPod job submitted: {job_id}")
+
+    # Poll
+    deadline = time.time() + RUNPOD_MAX_WAIT
+    while time.time() < deadline:
+        resp = session.get(f"{RUNPOD_ENDPOINT_URL}/status/{job_id}")
+        resp.raise_for_status()
+        data = resp.json()
+        status = data.get("status")
+        logger.info(f"[{image_id}] RunPod status: {status}")
+        if status == "COMPLETED":
+            output = data.get("output", {})
+            if not output.get("success"):
+                raise RuntimeError(f"RunPod job completed but reported failure: {output.get('error')}")
+            return output
+        if status == "FAILED":
+            raise RuntimeError(f"RunPod job failed: {data.get('error')}")
+        time.sleep(RUNPOD_POLL_INTERVAL)
+
+    raise TimeoutError(f"RunPod job {job_id} did not complete within {RUNPOD_MAX_WAIT}s")
+
 
 # ---------------------------------------------------------------------------
-# Shared preprocessing helper
+# Preprocessing — runs locally on Horizon, no GPU needed
 # ---------------------------------------------------------------------------
 
 def _preprocess(image_b64: str, image_id: str, tmp: Path):
-    """Decode image, run parallel_preprocess, return (rgb_img, ce_img, bounds)."""
+    """
+    Decode image, run parallel_preprocess, return (rgb_b64, ce_b64, bounds).
+
+    Unlike the original which returned PIL Images, this returns base64-encoded
+    PNG strings ready to POST directly to RunPod.
+    """
     import cv2
     from PIL import Image as _Image
+    from rtnls_fundusprep.preprocessor import parallel_preprocess
 
     cv2.setNumThreads(1)
-    runner = _get_runner()
 
     rgb_dir  = tmp / "rgb"; rgb_dir.mkdir()
     ce_dir   = tmp / "ce";  ce_dir.mkdir()
     img_path = tmp / f"{image_id}.jpg"
     img_path.write_bytes(base64.b64decode(image_b64))
 
-    bounds_list = runner.preprocess(
+    bounds_list = parallel_preprocess(
         [img_path], rgb_path=rgb_dir, ce_path=ce_dir, n_jobs=1,
     )
     result = bounds_list[0]
     if not result.get("success", True):
         raise RuntimeError(f"Preprocessing failed: {result}")
 
-    rgb_img = _Image.open(rgb_dir / f"{image_id}.png").convert("RGB")
-    ce_img  = _Image.open(ce_dir  / f"{image_id}.png").convert("RGB")
-    return rgb_img, ce_img, result
+    def _to_b64(p: Path) -> str:
+        img = _Image.open(p).convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+    rgb_b64 = _to_b64(rgb_dir / f"{image_id}.png")
+    ce_b64  = _to_b64(ce_dir  / f"{image_id}.png")
+
+    return rgb_b64, ce_b64, result
+
+
+# ---------------------------------------------------------------------------
+# FastMCP app
+# ---------------------------------------------------------------------------
+
+mcp = FastMCP("fundus-vascx")
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +241,8 @@ async def segment_av(
     """
     Run VascX artery/vein segmentation on a fundus image.
 
+    Preprocessing runs locally; GPU inference is dispatched to RunPod.
+
     Args:
         image_b64:  Base64-encoded RGB fundus image (JPEG or PNG).
         image_id:   Stem used for output filenames (e.g. "retina").
@@ -215,63 +256,62 @@ async def segment_av(
 
     try:
         await progress.set_total(3)
-        await progress.set_message("Loading models...")
-        runner = _get_runner()
-
         await progress.set_message("Preprocessing image...")
+
         with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
             try:
-                rgb_img, ce_img, bounds = _preprocess(image_b64, image_id, tmp)
+                rgb_b64, ce_b64, bounds = _preprocess(image_b64, image_id, Path(tmp))
             except RuntimeError as e:
                 return json.dumps({"success": False, "reason": str(e)})
 
-            await progress.increment()
-            await progress.set_message("Running AV segmentation...")
-            av_pred = runner.seg.predict_preprocessed(
-                [np.array(rgb_img)], [np.array(ce_img)]
-            )[0]
+        await progress.increment()
+        await progress.set_message("Running AV segmentation on RunPod...")
 
-            await progress.increment()
-            await progress.set_message("Computing mask statistics...")
-            av_raw  = av_pred.astype(np.uint8)
-            rgb_arr = np.array(rgb_img)
-            av_raw[rgb_arr.max(axis=2) <= 10] = 0
+        output = _runpod_dispatch("av", image_id, rgb_b64, ce_b64)
 
-            _A, _V, _X = 1, 2, 3
-            artery = ((av_raw == _A) | (av_raw == _X)).astype(np.uint8)
-            vein   = ((av_raw == _V) | (av_raw == _X)).astype(np.uint8)
+        await progress.increment()
+        await progress.set_message("Computing mask statistics...")
 
-            b      = bounds.get("bounds", {})
-            cx     = b.get("center", [0, 0])[0]
-            cy     = b.get("center", [0, 0])[1]
-            r      = b.get("radius", 0)
-            orig_h, orig_w = b.get("hw", (0, 0))
+        # Reconstruct av_raw from the serialised bytes RunPod returned
+        shape  = output["shape"]
+        av_raw = np.frombuffer(
+            base64.b64decode(output["av_raw_b64"]), dtype=np.uint8
+        ).reshape(shape)
 
-            buf = io.BytesIO()
-            np.savez_compressed(buf, artery=artery, vein=vein, av_raw=av_raw)
+        _A, _V, _X = 1, 2, 3
+        artery = ((av_raw == _A) | (av_raw == _X)).astype(np.uint8)
+        vein   = ((av_raw == _V) | (av_raw == _X)).astype(np.uint8)
 
-            payload = json.dumps({
-                "success":              True,
-                "image_id":             image_id,
-                "shape":                list(av_raw.shape),
-                "artery_pixel_count":   int(artery.sum()),
-                "vein_pixel_count":     int(vein.sum()),
-                "crossing_pixel_count": int((av_raw == _X).sum()),
-                "vessel_pixel_count":   int((av_raw >= 1).sum()),
-                "crop_bounds": {
-                    "cx": cx, "cy": cy, "radius": r,
-                    "orig_h": orig_h, "orig_w": orig_w,
-                    "x1": max(0, cx - r), "y1": max(0, cy - r),
-                    "x2": min(orig_w, cx + r), "y2": min(orig_h, cy + r),
-                },
-                "masks_b64":  base64.b64encode(buf.getvalue()).decode(),
-                "model":      AV_WEIGHTS.name,
-                "created_at": datetime.utcnow().isoformat() + "Z",
-            })
-            logger.info(f"AV payload size: {len(payload)/1024:.1f} KB")
-            await progress.increment()
-            return payload
+        b      = bounds.get("bounds", {})
+        cx     = b.get("center", [0, 0])[0]
+        cy     = b.get("center", [0, 0])[1]
+        r      = b.get("radius", 0)
+        orig_h, orig_w = b.get("hw", (0, 0))
+
+        buf = io.BytesIO()
+        np.savez_compressed(buf, artery=artery, vein=vein, av_raw=av_raw)
+
+        payload = json.dumps({
+            "success":              True,
+            "image_id":             image_id,
+            "shape":                list(av_raw.shape),
+            "artery_pixel_count":   int(artery.sum()),
+            "vein_pixel_count":     int(vein.sum()),
+            "crossing_pixel_count": int((av_raw == _X).sum()),
+            "vessel_pixel_count":   int((av_raw >= 1).sum()),
+            "crop_bounds": {
+                "cx": cx, "cy": cy, "radius": r,
+                "orig_h": orig_h, "orig_w": orig_w,
+                "x1": max(0, cx - r), "y1": max(0, cy - r),
+                "x2": min(orig_w, cx + r), "y2": min(orig_h, cy + r),
+            },
+            "masks_b64":  base64.b64encode(buf.getvalue()).decode(),
+            "model":      AV_WEIGHTS.name,
+            "created_at": datetime.utcnow().isoformat() + "Z",
+        })
+        logger.info(f"AV payload size: {len(payload)/1024:.1f} KB")
+        await progress.increment()
+        return payload
 
     except Exception as e:
         logger.error(f"segment_av failed: {e}", exc_info=True)
@@ -287,6 +327,8 @@ async def localize_fovea(
     """
     Localize the fovea (macula center) in a fundus image using VascX.
 
+    Preprocessing runs locally; GPU inference is dispatched to RunPod.
+
     Args:
         image_b64:  Base64-encoded RGB fundus image (JPEG or PNG).
         image_id:   Identifier for this image.
@@ -294,39 +336,32 @@ async def localize_fovea(
     Returns:
         JSON with fovea x, y coordinates in preprocessed image space.
     """
-    import numpy as np
-
     try:
         await progress.set_total(3)
-        await progress.set_message("Loading models...")
-        runner = _get_runner()
-
         await progress.set_message("Preprocessing image...")
+
         with tempfile.TemporaryDirectory() as tmp:
-            tmp = Path(tmp)
             try:
-                rgb_img, ce_img, _ = _preprocess(image_b64, image_id, tmp)
+                rgb_b64, ce_b64, _ = _preprocess(image_b64, image_id, Path(tmp))
             except RuntimeError as e:
                 return json.dumps({"success": False, "reason": str(e)})
 
-            await progress.increment()
-            await progress.set_message("Localizing fovea...")
-            hm_pred = runner.hm.predict_preprocessed(
-                [np.array(rgb_img)], [np.array(ce_img)]
-            )[0]
+        await progress.increment()
+        await progress.set_message("Localising fovea on RunPod...")
 
-            y, x = np.unravel_index(np.argmax(hm_pred), hm_pred.shape)
-            await progress.increment()
-            await progress.set_message("Done.")
+        output = _runpod_dispatch("fovea", image_id, rgb_b64, ce_b64)
 
-            await progress.increment()
-            return json.dumps({
-                "success":  True,
-                "image_id": image_id,
-                "x":        float(x),
-                "y":        float(y),
-                "model":    FOVEA_WEIGHTS.name,
-            })
+        await progress.increment()
+        await progress.set_message("Done.")
+        await progress.increment()
+
+        return json.dumps({
+            "success":  True,
+            "image_id": image_id,
+            "x":        output["x"],
+            "y":        output["y"],
+            "model":    FOVEA_WEIGHTS.name,
+        })
 
     except Exception as e:
         logger.error(f"localize_fovea failed: {e}", exc_info=True)
@@ -335,10 +370,16 @@ async def localize_fovea(
 
 @mcp.tool()
 async def health() -> str:
-    """Liveness probe. Reports weight file status and /tmp cache presence."""
+    """Liveness probe. Reports RunPod endpoint config and weight file status."""
+    runpod_ok = bool(RUNPOD_API_KEY and RUNPOD_ENDPOINT_URL)
     return json.dumps({
         "status":  "ok",
         "service": "fundus-vascx",
+        "runpod": {
+            "endpoint_url":    RUNPOD_ENDPOINT_URL or "(not set)",
+            "api_key_present": bool(RUNPOD_API_KEY),
+            "configured":      runpod_ok,
+        },
         "weights": {
             "artery_vein":  str(AV_WEIGHTS),
             "fovea":        str(FOVEA_WEIGHTS),
