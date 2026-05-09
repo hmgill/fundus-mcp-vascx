@@ -5,8 +5,7 @@ FastMCP server exposing VascX artery/vein segmentation and fovea
 localization as MCP tools, deployed via Prefect Horizon.
 
 Preprocessing runs locally (fundusprep); GPU inference is dispatched to a
-RunPod serverless endpoint so Horizon doesn't need a GPU or the heavy
-TorchScript weights baked in.
+RunPod serverless endpoint so Horizon doesn't need a GPU or model weights.
 
 Required environment variables:
     RUNPOD_API_KEY       RunPod API key
@@ -17,10 +16,6 @@ Optional environment variables:
     FASTMCP_DOCKET_URL   rediss://<host>:<port>  Redis for background tasks
     RUNPOD_POLL_INTERVAL Seconds between status polls (default: 3)
     RUNPOD_MAX_WAIT      Seconds before timeout (default: 120)
-
-Expected weight files (for health check only — not loaded locally):
-    weights/av_july24.pt        AV segmentation ensemble
-    weights/fovea-july24.pt     Fovea localization heatmap regression
 
 Tools:
     segment_av(image_b64, image_id)     → AV mask stats + base64 NPZ  [background task]
@@ -100,12 +95,8 @@ logger = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 
-WEIGHTS_DIR   = Path(__file__).parent / "weights"
-AV_WEIGHTS    = WEIGHTS_DIR / "av_july24.pt"
-FOVEA_WEIGHTS = WEIGHTS_DIR / "fovea-july24.pt"
-
-RUNPOD_API_KEY      = os.environ.get("RUNPOD_API_KEY", "")
-RUNPOD_ENDPOINT_URL = os.environ.get("RUNPOD_ENDPOINT_URL", "").rstrip("/")
+RUNPOD_API_KEY       = os.environ.get("RUNPOD_API_KEY", "")
+RUNPOD_ENDPOINT_URL  = os.environ.get("RUNPOD_ENDPOINT_URL", "").rstrip("/")
 RUNPOD_POLL_INTERVAL = int(os.environ.get("RUNPOD_POLL_INTERVAL", "3"))
 RUNPOD_MAX_WAIT      = int(os.environ.get("RUNPOD_MAX_WAIT", "120"))
 
@@ -144,7 +135,6 @@ def _runpod_dispatch(task: str, image_id: str, rgb_b64: str, ce_b64: str) -> dic
     """
     session = _runpod_session()
 
-    # Submit
     resp = session.post(
         f"{RUNPOD_ENDPOINT_URL}/run",
         json={"input": {
@@ -160,7 +150,6 @@ def _runpod_dispatch(task: str, image_id: str, rgb_b64: str, ce_b64: str) -> dic
         raise RuntimeError(f"No job ID in RunPod response: {resp.json()}")
     logger.info(f"[{image_id}] RunPod job submitted: {job_id}")
 
-    # Poll
     deadline = time.time() + RUNPOD_MAX_WAIT
     while time.time() < deadline:
         resp = session.get(f"{RUNPOD_ENDPOINT_URL}/status/{job_id}")
@@ -188,8 +177,7 @@ def _preprocess(image_b64: str, image_id: str, tmp: Path):
     """
     Decode image, run parallel_preprocess, return (rgb_b64, ce_b64, bounds).
 
-    Unlike the original which returned PIL Images, this returns base64-encoded
-    PNG strings ready to POST directly to RunPod.
+    Returns base64-encoded PNG strings ready to POST directly to RunPod.
     """
     import cv2
     from PIL import Image as _Image
@@ -272,7 +260,6 @@ async def segment_av(
         await progress.increment()
         await progress.set_message("Computing mask statistics...")
 
-        # Reconstruct av_raw from the serialised bytes RunPod returned
         shape  = output["shape"]
         av_raw = np.frombuffer(
             base64.b64decode(output["av_raw_b64"]), dtype=np.uint8
@@ -306,7 +293,6 @@ async def segment_av(
                 "x2": min(orig_w, cx + r), "y2": min(orig_h, cy + r),
             },
             "masks_b64":  base64.b64encode(buf.getvalue()).decode(),
-            "model":      AV_WEIGHTS.name,
             "created_at": datetime.utcnow().isoformat() + "Z",
         })
         logger.info(f"AV payload size: {len(payload)/1024:.1f} KB")
@@ -360,7 +346,6 @@ async def localize_fovea(
             "image_id": image_id,
             "x":        output["x"],
             "y":        output["y"],
-            "model":    FOVEA_WEIGHTS.name,
         })
 
     except Exception as e:
@@ -370,21 +355,14 @@ async def localize_fovea(
 
 @mcp.tool()
 async def health() -> str:
-    """Liveness probe. Reports RunPod endpoint config and weight file status."""
-    runpod_ok = bool(RUNPOD_API_KEY and RUNPOD_ENDPOINT_URL)
+    """Liveness probe. Reports RunPod endpoint configuration status."""
     return json.dumps({
         "status":  "ok",
         "service": "fundus-vascx",
         "runpod": {
             "endpoint_url":    RUNPOD_ENDPOINT_URL or "(not set)",
             "api_key_present": bool(RUNPOD_API_KEY),
-            "configured":      runpod_ok,
-        },
-        "weights": {
-            "artery_vein":  str(AV_WEIGHTS),
-            "fovea":        str(FOVEA_WEIGHTS),
-            "av_exists":    AV_WEIGHTS.exists(),
-            "fovea_exists": FOVEA_WEIGHTS.exists(),
+            "configured":      bool(RUNPOD_API_KEY and RUNPOD_ENDPOINT_URL),
         },
     })
 
