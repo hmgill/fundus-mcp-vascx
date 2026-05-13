@@ -5,17 +5,14 @@ FastMCP server exposing VascX artery/vein segmentation and fovea
 localization as MCP tools, deployed via Prefect Horizon.
 
 Preprocessing runs locally (fundusprep); GPU inference is dispatched to a
-RunPod serverless endpoint so Horizon doesn't need a GPU or model weights.
+Modal serverless endpoint so Horizon doesn't need a GPU or model weights.
 
 Required environment variables:
-    RUNPOD_API_KEY       RunPod API key
-    RUNPOD_ENDPOINT_URL  Full RunPod endpoint base URL,
-                         e.g. https://api.runpod.ai/v2/<endpoint_id>
+    MODAL_ENDPOINT_URL  Full Modal endpoint base URL,
+                        e.g. https://<workspace>--vascx-segmentation-fastapi-app.modal.run
 
 Optional environment variables:
-    FASTMCP_DOCKET_URL   rediss://<host>:<port>  Redis for background tasks
-    RUNPOD_POLL_INTERVAL Seconds between status polls (default: 3)
-    RUNPOD_MAX_WAIT      Seconds before timeout (default: 120)
+    FASTMCP_DOCKET_URL  rediss://<host>:<port>  Redis for background tasks
 
 Tools:
     segment_av(image_b64, image_id)     → AV mask stats + base64 NPZ  [background task]
@@ -77,15 +74,14 @@ import io
 import json
 import logging
 import os
-import time
 import tempfile
 from pathlib import Path
+from datetime import timedelta
 
 import requests
 from fastmcp import FastMCP
 from fastmcp.dependencies import Progress
 from fastmcp.server.tasks import TaskConfig
-from datetime import timedelta
 
 logging.basicConfig(format="[%(levelname)s]: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -95,15 +91,10 @@ logger = logging.getLogger(__name__)
 # Config
 # ---------------------------------------------------------------------------
 
-RUNPOD_API_KEY       = os.environ.get("RUNPOD_API_KEY", "")
-RUNPOD_ENDPOINT_URL  = os.environ.get("RUNPOD_ENDPOINT_URL", "").rstrip("/")
-RUNPOD_POLL_INTERVAL = int(os.environ.get("RUNPOD_POLL_INTERVAL", "3"))
-RUNPOD_MAX_WAIT      = int(os.environ.get("RUNPOD_MAX_WAIT", "120"))
+MODAL_ENDPOINT_URL = os.environ.get("MODAL_ENDPOINT_URL", "").rstrip("/")
 
-if not RUNPOD_API_KEY:
-    logger.warning("RUNPOD_API_KEY is not set — inference calls will fail.")
-if not RUNPOD_ENDPOINT_URL:
-    logger.warning("RUNPOD_ENDPOINT_URL is not set — inference calls will fail.")
+if not MODAL_ENDPOINT_URL:
+    logger.warning("MODAL_ENDPOINT_URL is not set — inference calls will fail.")
 
 _redis_url = os.environ.get("FASTMCP_DOCKET_URL")
 if not _redis_url:
@@ -114,59 +105,42 @@ if not _redis_url:
 
 
 # ---------------------------------------------------------------------------
-# RunPod client
+# Modal client
 # ---------------------------------------------------------------------------
 
-def _runpod_session() -> requests.Session:
-    """Return a requests Session pre-configured with RunPod auth headers."""
-    session = requests.Session()
-    session.headers.update({
-        "Authorization": f"Bearer {RUNPOD_API_KEY}",
-        "Content-Type":  "application/json",
-    })
-    return session
-
-
-def _runpod_dispatch(task: str, image_id: str, rgb_b64: str, ce_b64: str) -> dict:
+def _modal_dispatch(route: str, image_id: str, rgb_b64: str, ce_b64: str) -> dict:
     """
-    Submit a job to the RunPod serverless endpoint and poll until complete.
+    POST to a Modal inference endpoint and block until the result is returned.
+    Modal handles its own internal queueing and GPU scheduling.
 
-    Returns the output dict on success. Raises RuntimeError on failure or timeout.
+    Args:
+        route:      "/segment_av" or "/localize_fovea"
+        image_id:   Identifier for logging and response correlation.
+        rgb_b64:    Base64 PNG — preprocessed RGB crop (from fundusprep).
+        ce_b64:     Base64 PNG — preprocessed CE crop (from fundusprep).
+
+    Returns:
+        The output dict from Modal on success.
+        Raises RuntimeError on HTTP error or reported inference failure.
     """
-    session = _runpod_session()
+    if not MODAL_ENDPOINT_URL:
+        raise RuntimeError("MODAL_ENDPOINT_URL is not set.")
 
-    resp = session.post(
-        f"{RUNPOD_ENDPOINT_URL}/run",
-        json={"input": {
-            "task":     task,
-            "image_id": image_id,
-            "rgb_b64":  rgb_b64,
-            "ce_b64":   ce_b64,
-        }},
+    url = f"{MODAL_ENDPOINT_URL}{route}"
+    logger.info(f"[{image_id}] Dispatching to Modal: {url}")
+
+    resp = requests.post(
+        url,
+        json={"image_id": image_id, "rgb_b64": rgb_b64, "ce_b64": ce_b64},
+        timeout=120,
     )
     resp.raise_for_status()
-    job_id = resp.json().get("id")
-    if not job_id:
-        raise RuntimeError(f"No job ID in RunPod response: {resp.json()}")
-    logger.info(f"[{image_id}] RunPod job submitted: {job_id}")
+    output = resp.json()
 
-    deadline = time.time() + RUNPOD_MAX_WAIT
-    while time.time() < deadline:
-        resp = session.get(f"{RUNPOD_ENDPOINT_URL}/status/{job_id}")
-        resp.raise_for_status()
-        data = resp.json()
-        status = data.get("status")
-        logger.info(f"[{image_id}] RunPod status: {status}")
-        if status == "COMPLETED":
-            output = data.get("output", {})
-            if not output.get("success"):
-                raise RuntimeError(f"RunPod job completed but reported failure: {output.get('error')}")
-            return output
-        if status == "FAILED":
-            raise RuntimeError(f"RunPod job failed: {data.get('error')}")
-        time.sleep(RUNPOD_POLL_INTERVAL)
+    if not output.get("success"):
+        raise RuntimeError(f"Modal inference failed: {output.get('error')}")
 
-    raise TimeoutError(f"RunPod job {job_id} did not complete within {RUNPOD_MAX_WAIT}s")
+    return output
 
 
 # ---------------------------------------------------------------------------
@@ -176,8 +150,7 @@ def _runpod_dispatch(task: str, image_id: str, rgb_b64: str, ce_b64: str) -> dic
 def _preprocess(image_b64: str, image_id: str, tmp: Path):
     """
     Decode image, run parallel_preprocess, return (rgb_b64, ce_b64, bounds).
-
-    Returns base64-encoded PNG strings ready to POST directly to RunPod.
+    Returns base64-encoded PNG strings ready to POST directly to Modal.
     """
     import cv2
     from PIL import Image as _Image
@@ -229,7 +202,7 @@ async def segment_av(
     """
     Run VascX artery/vein segmentation on a fundus image.
 
-    Preprocessing runs locally; GPU inference is dispatched to RunPod.
+    Preprocessing runs locally; GPU inference is dispatched to Modal.
 
     Args:
         image_b64:  Base64-encoded RGB fundus image (JPEG or PNG).
@@ -253,9 +226,9 @@ async def segment_av(
                 return json.dumps({"success": False, "reason": str(e)})
 
         await progress.increment()
-        await progress.set_message("Running AV segmentation on RunPod...")
+        await progress.set_message("Running AV segmentation on Modal...")
 
-        output = _runpod_dispatch("av", image_id, rgb_b64, ce_b64)
+        output = _modal_dispatch("/segment_av", image_id, rgb_b64, ce_b64)
 
         await progress.increment()
         await progress.set_message("Computing mask statistics...")
@@ -311,9 +284,9 @@ async def localize_fovea(
     progress: Progress = Progress(),
 ) -> str:
     """
-    Localize the fovea (macula center) in a fundus image using VascX.
+    Localise the fovea (macula center) in a fundus image using VascX.
 
-    Preprocessing runs locally; GPU inference is dispatched to RunPod.
+    Preprocessing runs locally; GPU inference is dispatched to Modal.
 
     Args:
         image_b64:  Base64-encoded RGB fundus image (JPEG or PNG).
@@ -333,9 +306,9 @@ async def localize_fovea(
                 return json.dumps({"success": False, "reason": str(e)})
 
         await progress.increment()
-        await progress.set_message("Localising fovea on RunPod...")
+        await progress.set_message("Localising fovea on Modal...")
 
-        output = _runpod_dispatch("fovea", image_id, rgb_b64, ce_b64)
+        output = _modal_dispatch("/localize_fovea", image_id, rgb_b64, ce_b64)
 
         await progress.increment()
         await progress.set_message("Done.")
@@ -355,14 +328,13 @@ async def localize_fovea(
 
 @mcp.tool()
 async def health() -> str:
-    """Liveness probe. Reports RunPod endpoint configuration status."""
+    """Liveness probe. Reports Modal endpoint configuration status."""
     return json.dumps({
         "status":  "ok",
         "service": "fundus-vascx",
-        "runpod": {
-            "endpoint_url":    RUNPOD_ENDPOINT_URL or "(not set)",
-            "api_key_present": bool(RUNPOD_API_KEY),
-            "configured":      bool(RUNPOD_API_KEY and RUNPOD_ENDPOINT_URL),
+        "modal": {
+            "endpoint_url": MODAL_ENDPOINT_URL or "(not set)",
+            "configured":   bool(MODAL_ENDPOINT_URL),
         },
     })
 
