@@ -81,7 +81,7 @@ from datetime import timedelta
 import requests
 from fastmcp import FastMCP
 from fastmcp.dependencies import Progress
-from fastmcp.server.tasks import TaskConfig
+
 
 logging.basicConfig(format="[%(levelname)s]: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -193,7 +193,7 @@ mcp = FastMCP("fundus-vascx")
 # Tools
 # ---------------------------------------------------------------------------
 
-@mcp.tool(task=TaskConfig(mode="required", poll_interval=timedelta(seconds=5)))
+@mcp.tool()
 async def segment_av(
     image_b64: str,
     image_id: str,
@@ -277,7 +277,7 @@ async def segment_av(
         return json.dumps({"success": False, "error": str(e), "image_id": image_id})
 
 
-@mcp.tool(task=TaskConfig(mode="required", poll_interval=timedelta(seconds=5)))
+@mcp.tool()
 async def localize_fovea(
     image_b64: str,
     image_id: str,
