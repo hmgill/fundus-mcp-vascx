@@ -15,8 +15,8 @@ Optional environment variables:
     FASTMCP_DOCKET_URL  rediss://<host>:<port>  Redis for background tasks
 
 Tools:
-    segment_av(image_b64, image_id)     → AV mask stats + base64 NPZ  [background task]
-    localize_fovea(image_b64, image_id) → fovea (x, y) coordinates    [background task]
+    segment_av(image_b64, image_id)     → AV mask stats + base64 NPZ
+    localize_fovea(image_b64, image_id) → fovea (x, y) coordinates
     health()                            → liveness check
 """
 
@@ -25,9 +25,7 @@ from __future__ import annotations
 import subprocess
 import sys
 
-# ---------------------------------------------------------------------------
-# Force headless OpenCV before any other import touches cv2.
-# ---------------------------------------------------------------------------
+
 def _ensure_headless_opencv():
     try:
         import importlib.util
@@ -47,14 +45,11 @@ def _ensure_headless_opencv():
 
 _ensure_headless_opencv()
 
-# ---------------------------------------------------------------------------
-# Ensure retinalysis-inference is importable.
-# ---------------------------------------------------------------------------
+
 def _ensure_rtnls_inference():
     try:
         import rtnls_inference  # noqa: F401
     except ImportError:
-        print("[INFO]: rtnls_inference not found, installing retinalysis-inference --no-deps ...", file=sys.stderr)
         try:
             subprocess.check_call([
                 sys.executable, "-m", "pip", "install", "--quiet",
@@ -62,7 +57,6 @@ def _ensure_rtnls_inference():
             ])
             import importlib
             importlib.invalidate_caches()
-            print("[INFO]: retinalysis-inference installed.", file=sys.stderr)
         except Exception as e:
             print(f"[ERROR]: Failed to install retinalysis-inference: {e}", file=sys.stderr)
 
@@ -76,32 +70,17 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from datetime import timedelta
 
 import requests
 from fastmcp import FastMCP
-from fastmcp.dependencies import Progress
-
 
 logging.basicConfig(format="[%(levelname)s]: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
 
 MODAL_ENDPOINT_URL = os.environ.get("MODAL_ENDPOINT_URL", "").rstrip("/")
 
 if not MODAL_ENDPOINT_URL:
     logger.warning("MODAL_ENDPOINT_URL is not set — inference calls will fail.")
-
-_redis_url = os.environ.get("FASTMCP_DOCKET_URL")
-if not _redis_url:
-    logger.warning(
-        "FASTMCP_DOCKET_URL is not set — background tasks will fail across "
-        "stateless HTTP requests. Set this to your Redis URL in Horizon env vars."
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -109,20 +88,6 @@ if not _redis_url:
 # ---------------------------------------------------------------------------
 
 def _modal_dispatch(route: str, image_id: str, rgb_b64: str, ce_b64: str) -> dict:
-    """
-    POST to a Modal inference endpoint and block until the result is returned.
-    Modal handles its own internal queueing and GPU scheduling.
-
-    Args:
-        route:      "/segment_av" or "/localize_fovea"
-        image_id:   Identifier for logging and response correlation.
-        rgb_b64:    Base64 PNG — preprocessed RGB crop (from fundusprep).
-        ce_b64:     Base64 PNG — preprocessed CE crop (from fundusprep).
-
-    Returns:
-        The output dict from Modal on success.
-        Raises RuntimeError on HTTP error or reported inference failure.
-    """
     if not MODAL_ENDPOINT_URL:
         raise RuntimeError("MODAL_ENDPOINT_URL is not set.")
 
@@ -144,14 +109,10 @@ def _modal_dispatch(route: str, image_id: str, rgb_b64: str, ce_b64: str) -> dic
 
 
 # ---------------------------------------------------------------------------
-# Preprocessing — runs locally on Horizon, no GPU needed
+# Preprocessing — runs locally, no GPU needed
 # ---------------------------------------------------------------------------
 
 def _preprocess(image_b64: str, image_id: str, tmp: Path):
-    """
-    Decode image, run parallel_preprocess, return (rgb_b64, ce_b64, bounds).
-    Returns base64-encoded PNG strings ready to POST directly to Modal.
-    """
     import cv2
     from PIL import Image as _Image
     from rtnls_fundusprep.preprocessor import parallel_preprocess
@@ -178,7 +139,6 @@ def _preprocess(image_b64: str, image_id: str, tmp: Path):
 
     rgb_b64 = _to_b64(rgb_dir / f"{image_id}.png")
     ce_b64  = _to_b64(ce_dir  / f"{image_id}.png")
-
     return rgb_b64, ce_b64, result
 
 
@@ -194,11 +154,7 @@ mcp = FastMCP("fundus-vascx")
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-async def segment_av(
-    image_b64: str,
-    image_id: str,
-    progress: Progress = Progress(),
-) -> str:
+async def segment_av(image_b64: str, image_id: str) -> str:
     """
     Run VascX artery/vein segmentation on a fundus image.
 
@@ -216,22 +172,13 @@ async def segment_av(
     from datetime import datetime
 
     try:
-        await progress.set_total(3)
-        await progress.set_message("Preprocessing image...")
-
         with tempfile.TemporaryDirectory() as tmp:
             try:
                 rgb_b64, ce_b64, bounds = _preprocess(image_b64, image_id, Path(tmp))
             except RuntimeError as e:
                 return json.dumps({"success": False, "reason": str(e)})
 
-        await progress.increment()
-        await progress.set_message("Running AV segmentation on Modal...")
-
         output = _modal_dispatch("/segment_av", image_id, rgb_b64, ce_b64)
-
-        await progress.increment()
-        await progress.set_message("Computing mask statistics...")
 
         shape  = output["shape"]
         av_raw = np.frombuffer(
@@ -268,8 +215,7 @@ async def segment_av(
             "masks_b64":  base64.b64encode(buf.getvalue()).decode(),
             "created_at": datetime.utcnow().isoformat() + "Z",
         })
-        logger.info(f"AV payload size: {len(payload)/1024:.1f} KB")
-        await progress.increment()
+        logger.info(f"segment_av: {image_id}  payload={len(payload)/1024:.1f}KB")
         return payload
 
     except Exception as e:
@@ -278,13 +224,9 @@ async def segment_av(
 
 
 @mcp.tool()
-async def localize_fovea(
-    image_b64: str,
-    image_id: str,
-    progress: Progress = Progress(),
-) -> str:
+async def localize_fovea(image_b64: str, image_id: str) -> str:
     """
-    Localise the fovea (macula center) in a fundus image using VascX.
+    Localise the fovea (macula centre) in a fundus image using VascX.
 
     Preprocessing runs locally; GPU inference is dispatched to Modal.
 
@@ -296,23 +238,13 @@ async def localize_fovea(
         JSON with fovea x, y coordinates in preprocessed image space.
     """
     try:
-        await progress.set_total(3)
-        await progress.set_message("Preprocessing image...")
-
         with tempfile.TemporaryDirectory() as tmp:
             try:
                 rgb_b64, ce_b64, _ = _preprocess(image_b64, image_id, Path(tmp))
             except RuntimeError as e:
                 return json.dumps({"success": False, "reason": str(e)})
 
-        await progress.increment()
-        await progress.set_message("Localising fovea on Modal...")
-
         output = _modal_dispatch("/localize_fovea", image_id, rgb_b64, ce_b64)
-
-        await progress.increment()
-        await progress.set_message("Done.")
-        await progress.increment()
 
         return json.dumps({
             "success":  True,
